@@ -1,177 +1,98 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>        // for ESP8266
-#include <BlynkSimpleEsp8266.h> // for ESP8266
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
 
-#include <ESP8266mDNS.h> // For OTA w/ ESP8266
-#include <WiFiUdp.h>     // For OTA
-#include <ArduinoOTA.h>  // For OTA
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 
-char auth[] = "";
-char ssid[] = "";
-char pass[] = "";
-
-BlynkTimer timer;
+#include <Ultrasonic.h>
+#include <RunningMedian.h>
+#include <SimpleKalmanFilter.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-OneWire oneWire(D7);
-DallasTemperature sensors(&oneWire);
-DeviceAddress Thermometer = {0x28, 0x3C, 0x58, 0x77, 0x91, 0x0B, 0x02, 0x17};
-
-//Sinric//
 #include "SinricPro.h"
 #include "SinricProSwitch.h"
+#include "MiniUpCredentials.h"
 
-#define APP_KEY ""
-#define APP_SECRET ""
-#define SWITCH_ID ""
+OneWire oneWire(D7);
+DallasTemperature tempSensor(&oneWire);
+DeviceAddress tempSensorAddr = {0x28, 0x3C, 0x58, 0x77, 0x91, 0x0B, 0x02, 0x17};
 
-#define RELAY_PIN D1
+Ultrasonic pingSensor(D5, D6);
 
-//Ultrasonic//
-#include <Ultrasonic.h>
-Ultrasonic ultrasonic(D5, D6);
+RunningMedian tempMedianFilter = RunningMedian(3);
+RunningMedian pingMedianFilter = RunningMedian(5);
 
-//Filter's//
-#include <RunningMedian.h>
-RunningMedian TempInput = RunningMedian(3);
-RunningMedian SonarInput = RunningMedian(5);
+SimpleKalmanFilter kalmanFilter(3.0, 3.0, 0.1);
 
-#include <SimpleKalmanFilter.h>
-SimpleKalmanFilter SonarFilter(3.0, 3.0, 0.1);
+BlynkTimer timer;
 
-//Variable's//
-class SonarData
+float litre, flow_rate, temp;
+
+double soundSpeed(double c)
 {
-  public:
-  float raw, litre, change, prev, filtered;
-
-  void Get();
-  void Filter();
-  void Process();
-  void Rate();
-} sonar;
-
-class TempData
-{
-  public:
-  float raw, filtered;
-
-  void Get();
-  void Filter();
-  void Process();
-} temp;
-
-bool PowerState = false;
-
-#define DivideRatio 1.21
-#define MultiplyRatio 20
-#define MaxHeight 132
-
-float SoundSpeed(float C)
-{
-  float speed = 331.3 + 0.606 * C;
-  return speed / 20000.0;
+  double s = 331.3 + 0.606 * c;
+  return s / 20000.0;
 }
 
-void SonarData::Get()
+void pingTimer()
 {
-  unsigned int ping_time = ultrasonic.timing();
-  if (isnan(ping_time))
+  float rv = pingSensor.readTiming() * soundSpeed(temp);
+
+  pingMedianFilter.add(rv);
+
+  rv = (MAX_HEIGHT - pingMedianFilter.getMedian()) / DIVIDE_RATIO;
+  litre = constrain(kalmanFilter.updateEstimate(rv), 0, 100) * MULTIPLY_RATIO;
+}
+
+void flowTimer()
+{
+  static float pl;
+  flow_rate = litre - pl;
+  pl = litre;
+}
+
+void tempTimer()
+{
+  tempSensor.requestTemperatures();
+  float rv = tempSensor.getTempC(tempSensorAddr);
+
+  if (!isnan(rv) && rv > -10 && rv < 70)
   {
-    return;
+    tempMedianFilter.add(rv);
   }
-  sonar.raw = ping_time;
+
+  temp = tempMedianFilter.getMedian();
+  Blynk.virtualWrite(V4, temp);
 }
 
-void SonarData::Filter()
+void sendLitre()
 {
-  float sonar_dist = sonar.raw * SoundSpeed(temp.filtered);
-  if (sonar_dist > 21.0)
-  {
-    SonarInput.add(sonar_dist);
-  }
+  int v = round(litre);
+  Blynk.virtualWrite(V2, v);
 }
 
-void SonarData::Process()
+void sendRate()
 {
-  sonar.filtered = SonarInput.getMedian();
-  sonar.filtered = (MaxHeight - sonar.filtered) / DivideRatio;
-  sonar.filtered = SonarFilter.updateEstimate(sonar.filtered);
-  sonar.filtered = constrain(sonar.filtered, 0, 100);
-  sonar.litre = sonar.filtered * MultiplyRatio;
+  String v = String(flow_rate, 1);
+  Blynk.virtualWrite(V3, v);
 }
 
-void SonarData::Rate()
+void timerSetup()
 {
-  sonar.change = sonar.litre - sonar.prev;
-  sonar.prev = sonar.litre;
-}
-
-void SonarTimer()
-{
-  sonar.Get();
-  sonar.Filter();
-  sonar.Process();
-}
-
-void TempData::Get()
-{
-  sensors.requestTemperatures();
-  float temp_c = sensors.getTempC(Thermometer);
-  if (isnan(temp_c))
-  {
-    return;
-  }
-  temp.raw = temp_c;
-}
-
-void TempData::Filter()
-{
-  if (temp.raw > -10 && temp.raw < 70)
-  {
-    TempInput.add(temp.raw);
-  }
-}
-
-void TempData::Process()
-{
-  temp.filtered = TempInput.getMedian();
-}
-
-void TempTimer()
-{
-  temp.Get();
-  temp.Filter();
-  temp.Process();
-
-  Blynk.virtualWrite(V4, temp.filtered);
-}
-
-void SendData()
-{
-  long RoundIndex = round(sonar.litre);
-  Blynk.virtualWrite(V2, RoundIndex);
-
-  String FormatIndex = String(sonar.change, 1);
-  Blynk.virtualWrite(V3, FormatIndex);
-}
-
-void TimerStart()
-{
-  delay(20);
-  timer.setInterval(5000L, TempTimer);
-  delay(20);
-  timer.setInterval(100L, SonarTimer);
-  delay(20);
-  timer.setInterval(60000L, [](){
-    sonar.Rate();
-  });
-  delay(20);
-  timer.setTimeout(12000L, []() {
-    timer.setInterval(1000L, SendData);
-  });
+  timer.setInterval(10000L, tempTimer);
+  delay(40);
+  timer.setInterval(500L, pingTimer);
+  delay(40);
+  timer.setInterval(60000L, flowTimer);
+  delay(40);
+  timer.setInterval(30000L, sendRate);
+  delay(40);
+  timer.setTimeout(30000L, []()
+                   { timer.setInterval(1000L, sendLitre); });
 }
 
 BLYNK_CONNECTED()
@@ -179,60 +100,55 @@ BLYNK_CONNECTED()
   Blynk.syncAll();
 }
 
-void LedSetup()
+void switchSetup()
 {
-  pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
+  pinMode(RELAY_PIN, OUTPUT);
 }
 
 bool onPowerState(const String &deviceId, bool &state)
 {
-  PowerState = state;
-  Blynk.virtualWrite(V10, PowerState);
-  digitalWrite(RELAY_PIN, PowerState ? LOW : HIGH);
+  bool relay_state = state;
+  Blynk.virtualWrite(V10, relay_state);
+  digitalWrite(RELAY_PIN, relay_state ? LOW : HIGH);
   return true;
 }
 
 BLYNK_WRITE(V10)
 {
-  int pinValue = param.asInt();
-  if(pinValue){
-    PowerState = true;
-  } else {
-    PowerState = false;
-  }
+  bool relay_state = param.asInt();
 
   SinricProSwitch &mySwitch = SinricPro[SWITCH_ID];
-  mySwitch.sendPowerStateEvent(PowerState);
+  mySwitch.sendPowerStateEvent(relay_state);
 
-  digitalWrite(RELAY_PIN, PowerState ? LOW : HIGH);
+  digitalWrite(RELAY_PIN, relay_state ? LOW : HIGH);
 }
 
 void setup()
 {
-  LedSetup();
-  sensors.begin();
+  switchSetup();
+  tempSensor.begin();
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
+  WiFi.begin(SSID, PASS);
 
-  SinricProSwitch &mySwitch = SinricPro[SWITCH_ID]; // create new switch device
-  mySwitch.onPowerState(onPowerState);              // apply onPowerState callback
-  SinricPro.begin(APP_KEY, APP_SECRET);             // start SinricPro
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.begin();
 
-  Blynk.config(auth, "blynk-cloud.com", 80);
+  Blynk.config(AUTH, SERVER_ADDRESS, 80);
   Blynk.connect();
 
-  ArduinoOTA.setHostname("Esp8266 Up"); // For OTA
-  ArduinoOTA.begin();                   // For OTA
+  SinricProSwitch &mySwitch = SinricPro[SWITCH_ID];
+  mySwitch.onPowerState(onPowerState);
+  SinricPro.begin(APP_KEY, APP_SECRET);
 
-  TimerStart();
+  timerSetup();
 }
 
 void loop()
 {
-  timer.run();
-  Blynk.run();
-  SinricPro.handle();
   ArduinoOTA.handle();
+  Blynk.run();
+  timer.run();
+  SinricPro.handle();
 }
